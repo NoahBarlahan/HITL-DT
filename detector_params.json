@@ -1,0 +1,14 @@
+{
+  "min_area": 660,
+  "circularity_thresh": 0.8099999999999999,
+  "fill_ratio_thresh": 0.7,
+  "min_radius": 12,
+  "max_radius": 220,
+  "morph_kernel": 3,
+  "min_loose_pixels": 124,
+  "min_conf_to_accept": 0.55,
+  "learn_step_sv": 8,
+  "learn_step_area": 120,
+  "learn_step_circ": 0.01,
+  "learn_step_fill": 0.01
+}

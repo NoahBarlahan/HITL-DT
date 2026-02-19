@@ -1,0 +1,17 @@
+import cv2
+
+def test(index, backend):
+    cap = cv2.VideoCapture(index, backend)
+    ok = cap.isOpened()
+    print(f"index={index}, backend={backend}: opened={ok}")
+    if ok:
+        ret, frame = cap.read()
+        print(" read=", ret, " shape=", None if frame is None else frame.shape)
+    cap.release()
+
+for i in range(10):
+    test(i, cv2.CAP_DSHOW)
+
+print("---- MSMF ----")
+for i in range(10):
+    test(i, cv2.CAP_MSMF)
