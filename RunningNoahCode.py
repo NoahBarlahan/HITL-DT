@@ -1,12 +1,6 @@
 import cv2
 import numpy as np
-<<<<<<< HEAD
-import time
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
-=======
 from typing import Dict, List, Tuple
->>>>>>> Add local vision code
 
 
 # ---------------- Camera ----------------
