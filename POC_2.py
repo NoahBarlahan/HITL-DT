@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 import time
-import json
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -76,7 +75,18 @@ MIN_CENTER_SEPARATION = 0.18  # in feature space; prevents “3 bins = same colo
 
 # Unknown detection
 UNKNOWN_DIST_THRESH = 0.35  # feature-space threshold; tune
-RULES_JSON = "unknown_color_rules.json"
+
+# ============================================================
+# ONLINE LEARNING (NO SAVING; resets every run)
+# ============================================================
+
+ONLINE_LEARN = True               # update centers during this run (in-memory only)
+LEARN_FROM_AUTOCONF = True        # also learn from confident auto labels
+AUTOCONF_LEARN_THRESH = 0.18      # only auto-learn if distance is small (tune)
+MAX_SAMPLES_PER_BIN = 800         # cap memory use per bin
+
+# If you want HITL to stop asking repeatedly for the same unknown within THIS run:
+USE_IN_MEMORY_UNKNOWN_RULES = True   # rules reset on quit
 
 
 # ============================================================
@@ -187,24 +197,14 @@ def move_pick_and_optional_drop(
 
 
 # ============================================================
-# Rules for unknown colors
+# HITL prompt (no saving)
 # ============================================================
 
-def load_rules() -> Dict[str, str]:
-    try:
-        with open(RULES_JSON, "r") as f:
-            d = json.load(f)
-        return d if isinstance(d, dict) else {}
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        return {}
-
-def save_rules(rules: Dict[str, str]):
-    with open(RULES_JSON, "w") as f:
-        json.dump(rules, f, indent=2)
-
 def make_sig(mean_hsv: np.ndarray) -> str:
+    """
+    Coarse signature so 'similar' colors map to the same bucket during this run.
+    This is ONLY in-memory if USE_IN_MEMORY_UNKNOWN_RULES=True.
+    """
     h = int(mean_hsv[0] // 8)
     s = int(mean_hsv[1] // 16)
     v = int(mean_hsv[2] // 16)
@@ -277,7 +277,6 @@ def detect_objects_edges(frame_bgr) -> List[Tuple[int, int, int, int, np.ndarray
 
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, APPROX_EPS_FRAC * peri, True)
-        # allow some noise; blocks are often ~4 corners but can be more under blur
         if not (4 <= len(approx) <= 20):
             continue
 
@@ -288,13 +287,13 @@ def detect_objects_edges(frame_bgr) -> List[Tuple[int, int, int, int, np.ndarray
     return dets
 
 def roi_hsv_and_mask_from_contour(frame_bgr, contour: np.ndarray):
-    H, W = frame_bgr.shape[:2]
+    Hh, Ww = frame_bgr.shape[:2]
     x, y, bw, bh = cv2.boundingRect(contour)
     pad = 2
     x1 = max(x - pad, 0)
     y1 = max(y - pad, 0)
-    x2 = min(x + bw + pad, W - 1)
-    y2 = min(y + bh + pad, H - 1)
+    x2 = min(x + bw + pad, Ww - 1)
+    y2 = min(y + bh + pad, Hh - 1)
 
     roi = frame_bgr[y1:y2, x1:x2]
     if roi.size == 0:
@@ -338,25 +337,22 @@ def mean_hsv_interior(hsv_roi: np.ndarray, mask: np.ndarray) -> Optional[np.ndar
 
 def hsv_to_feature(mean_hsv: np.ndarray) -> np.ndarray:
     """
-    Circular hue embedding to prevent 'red wrap' issues:
+    Circular hue embedding:
       feature = [cos(theta), sin(theta), S_norm, V_norm]
     """
-    H, S, V = float(mean_hsv[0]), float(mean_hsv[1]), float(mean_hsv[2])
-    theta = 2.0 * np.pi * (H / 180.0)
+    Hh, S, V = float(mean_hsv[0]), float(mean_hsv[1]), float(mean_hsv[2])
+    theta = 2.0 * np.pi * (Hh / 180.0)
     return np.array([np.cos(theta), np.sin(theta), S / 255.0, V / 255.0], dtype=np.float32)
 
 def feature_to_hsv(center_feat: np.ndarray) -> np.ndarray:
-    """
-    Convert feature center back to HSV for display swatch.
-    """
     c, s = float(center_feat[0]), float(center_feat[1])
     ang = np.arctan2(s, c)
     if ang < 0:
         ang += 2.0 * np.pi
-    H = (ang * 180.0 / (2.0 * np.pi))
+    Hh = (ang * 180.0 / (2.0 * np.pi))
     S = float(np.clip(center_feat[2] * 255.0, 0, 255))
     V = float(np.clip(center_feat[3] * 255.0, 0, 255))
-    return np.array([H, S, V], dtype=np.float32)
+    return np.array([Hh, S, V], dtype=np.float32)
 
 def hsv_patch_to_bgr(hsv_center: np.ndarray):
     hsv_px = np.uint8([[[int(hsv_center[0]) % 180, int(hsv_center[1]), int(hsv_center[2])]]])
@@ -371,7 +367,6 @@ def train_bins_kmeans(features: np.ndarray) -> np.ndarray:
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 60, 0.2)
     _, _, centers = cv2.kmeans(features, N_BINS, None, criteria, 8, cv2.KMEANS_PP_CENTERS)
 
-    # sort by hue angle for stable BIN numbering
     hues = []
     for c in centers:
         hsv = feature_to_hsv(c)
@@ -384,13 +379,32 @@ def assign_bin(feature: np.ndarray, centers: np.ndarray) -> Tuple[str, float]:
     idx = int(np.argmin(d))
     return f"BIN_{idx+1}", float(d[idx])
 
+def recompute_centers_from_samples(samples: Dict[str, List[np.ndarray]], fallback_centers: np.ndarray) -> np.ndarray:
+    """
+    In-memory online learning: per-bin center = mean(samples) if any, else keep current center.
+    Normalizes the (cos,sin) part to stay on the unit circle.
+    """
+    new_centers = fallback_centers.copy().astype(np.float32)
+    for i, b in enumerate(("BIN_1", "BIN_2", "BIN_3")):
+        if len(samples[b]) > 0:
+            arr = np.vstack(samples[b]).astype(np.float32)
+            new_centers[i] = arr.mean(axis=0)
+
+            cs = new_centers[i, 0:2]
+            norm = float(np.linalg.norm(cs))
+            if norm > 1e-6:
+                new_centers[i, 0:2] = cs / norm
+    return new_centers
+
 
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
-    rules = load_rules()
+    # In-memory only; resets on quit
+    rules: Dict[str, str] = {}  # signature -> BIN_1/2/3 (optional; only within this run)
+    bin_samples: Dict[str, List[np.ndarray]] = {"BIN_1": [], "BIN_2": [], "BIN_3": []}
 
     # ---- RoboDK init ----
     rdk = robolink.Robolink()
@@ -444,7 +458,20 @@ def main():
     print(f"[INFO] Training time: {TRAIN_SECONDS:.1f}s (will auto-train).")
     print("[INFO] Phase 2: INFERENCE — add NEW parts; system classifies and moves RoboDK robot.")
     print("[INFO] HITL: unknown colors prompt you for action (assign/skip/retrain).")
+    print("[INFO] NOTE: NO SAVING. Quit = full reset next run.")
     print("[INFO] Keys: q/ESC quit | r retrain bins")
+
+    def reset_for_retrain():
+        nonlocal trained, centers, train_start, per_obj_features, rules, bin_samples
+        trained = False
+        centers = None
+        train_start = time.time()
+        per_obj_features = {}
+        rules = {}
+        bin_samples = {"BIN_1": [], "BIN_2": [], "BIN_3": []}
+        for o in tracked.values():
+            o.acted = False
+            o.bin_name = "UNASSIGNED"
 
     while True:
         ok, frame = cap.read()
@@ -479,7 +506,6 @@ def main():
             hsv_roi, mask = roi_hsv_and_mask_from_contour(frame, cnt)
             mean = mean_hsv_interior(hsv_roi, mask)
             if mean is None:
-                # keep old color if this frame is bad
                 mean = tracked[oid].mean_hsv
             feat = hsv_to_feature(mean)
 
@@ -562,10 +588,13 @@ def main():
                         print("\n[INFO] MODEL TRAINED: learned 3 dominant color bins (BIN_1..BIN_3).")
                         print("[INFO] Existing objects will NOT trigger motion. Only NEW stable objects after this point will.\n")
 
-                        # mark everything currently visible as already handled
                         for obj in tracked.values():
                             obj.acted = True
                             obj.bin_name = "TRAINING_SET"
+
+                        # Reset in-memory learners for inference phase (optional, but keeps it clean)
+                        rules = {}
+                        bin_samples = {"BIN_1": [], "BIN_2": [], "BIN_3": []}
 
                 else:
                     print("[WARN] Not enough stable objects to train. Keep 3 blocks visible and separated; continuing training...")
@@ -582,33 +611,49 @@ def main():
                 # classify
                 bin_guess, dmin = assign_bin(obj.feat, centers)
                 sig = make_sig(obj.mean_hsv)
-                forced = rules.get(sig)
 
-                final_bin = None
+                forced = rules.get(sig) if USE_IN_MEMORY_UNKNOWN_RULES else None
+                final_bin: Optional[str] = None
 
+                # Unknown? Ask HITL
                 if (dmin > UNKNOWN_DIST_THRESH) and (forced is None):
                     action = ask_user_unknown_action(sig=sig, suggested=bin_guess)
+
                     if action == "RETRAIN":
-                        trained = False
-                        centers = None
-                        train_start = time.time()
-                        per_obj_features = {}
-                        for o in tracked.values():
-                            o.acted = False
-                            o.bin_name = "UNASSIGNED"
                         print("\n[INFO] Retraining started. Show your 3 majority colors again.")
-                        break  # exit this inference pass
-                    elif action == "SKIP":
+                        reset_for_retrain()
+                        break  # exit inference loop
+
+                    if action == "SKIP":
                         obj.bin_name = "UNKNOWN_SKIP"
                         obj.acted = True
                         continue
-                    else:
-                        # user assigned to a bin; remember for next time
+
+                    # action is BIN_1/2/3
+                    final_bin = action
+
+                    # remember within this run (optional)
+                    if USE_IN_MEMORY_UNKNOWN_RULES:
                         rules[sig] = action
-                        save_rules(rules)
-                        final_bin = action
+
+                    # ONLINE LEARNING from HITL label (in-memory only)
+                    if ONLINE_LEARN:
+                        bin_samples[final_bin].append(obj.feat.astype(np.float32))
+                        if len(bin_samples[final_bin]) > MAX_SAMPLES_PER_BIN:
+                            bin_samples[final_bin] = bin_samples[final_bin][-MAX_SAMPLES_PER_BIN:]
+                        centers = recompute_centers_from_samples(bin_samples, centers)
+
                 else:
+                    # Known by rule or normal auto classification
                     final_bin = forced if forced is not None else bin_guess
+
+                    # Optional online learning from confident auto labels / forced rules
+                    if ONLINE_LEARN and LEARN_FROM_AUTOCONF:
+                        if (forced is not None) or (dmin <= AUTOCONF_LEARN_THRESH):
+                            bin_samples[final_bin].append(obj.feat.astype(np.float32))
+                            if len(bin_samples[final_bin]) > MAX_SAMPLES_PER_BIN:
+                                bin_samples[final_bin] = bin_samples[final_bin][-MAX_SAMPLES_PER_BIN:]
+                            centers = recompute_centers_from_samples(bin_samples, centers)
 
                 obj.bin_name = final_bin
                 obj.acted = True
@@ -666,20 +711,14 @@ def main():
             cv2.putText(vis, f"id{oid} {obj.bin_name} st={obj.stable_frames} acted={obj.acted}",
                         (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
-        cv2.imshow("RoboDK + Trained Bins + HITL", vis)
+        cv2.imshow("RoboDK + Trained Bins + HITL (No Save)", vis)
         key = cv2.waitKey(1) & 0xFF
 
         if key in (ord("q"), 27):
             break
         if key in (ord("r"), ord("R")):
-            trained = False
-            centers = None
-            train_start = time.time()
-            per_obj_features = {}
-            for o in tracked.values():
-                o.acted = False
-                o.bin_name = "UNASSIGNED"
             print("\n[INFO] Manual retrain triggered. Show your 3 majority colors again.")
+            reset_for_retrain()
 
     cap.release()
     cv2.destroyAllWindows()
