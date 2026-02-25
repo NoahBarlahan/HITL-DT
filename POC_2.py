@@ -32,6 +32,7 @@ LABEL_TO_DROP_TARGETS = {
     LABEL_OTHER: ("OTHER_DROP_APP", "OTHER_DROP"),
 }
 
+# Names for dynamic pick targets we will update each time
 DYN_PICK_APP_NAME = "CUR_PICK_APP"
 DYN_PICK_NAME = "CUR_PICK"
 
@@ -44,23 +45,28 @@ FRAME_W = 640
 FRAME_H = 480
 
 # ============================================================
-# VISION SETTINGS (Box-draw training + robust detection)
+# VISION SETTINGS (Box-draw training + detection)
 # ============================================================
 
 WINDOW_NAME = "RoboDK + Box Learn (TARGET vs OTHER) [No Save]"
 
-# Candidate region detection (bboxes)
-MIN_AREA_PX = 1000
+# Candidate region detection (bboxes from edges)
+MIN_AREA_PX = 2500
 MAX_AREA_PX = 250000
 
 # Tracking
 MATCH_DIST_PX = 90
 MISSING_FRAMES_TO_REMOVE = 20
-STABLE_FRAMES_TO_ACT = 6
 
-# Confidence thresholds
+# MUST see object for this many seconds before it can be treated as a real object
+SEEN_SECONDS_TO_ACT = 2.0
+
+# Confidence thresholds (TARGET-vs-OTHER)
 CONF_THRESH_TARGET = 0.80
 CONF_THRESH_OTHER = 0.30
+
+# If it matches NOT-OBJECT this confidently, ignore automatically
+CONF_THRESH_NOT_OBJECT = 0.75
 
 # Similarity scaling (higher => higher confidence)
 DIST_SCALE = 1.2
@@ -69,8 +75,9 @@ DIST_SCALE = 1.2
 ROI_SIZE = (96, 96)  # normalization size for descriptors
 HOG_WIN = (96, 96)
 
-MAX_TARGET_SAMPLES = 200
-
+# In-memory learning caps
+MAX_TARGET_SAMPLES = 80
+MAX_NOT_OBJECT_SAMPLES = 200
 
 # ============================================================
 # DATA STRUCTURES
@@ -84,13 +91,12 @@ class TrackedObj:
     w: int
     h: int
     last_seen_frame: int
-    stable_frames: int
+    first_seen_t: float
     last_update_t: float
 
-    feat: np.ndarray           # descriptor vector
+    feat: np.ndarray
     label: str
     acted: bool
-
 
 # ============================================================
 # RoboDK helpers
@@ -175,7 +181,6 @@ def move_pick_and_optional_drop(
         print("[RoboDK] Move error:", e)
         print("Common causes: unreachable target, wrong BoardFrame pose, wrong homography, wrong tool.")
 
-
 # ============================================================
 # Feature extraction (HOG + HSV hist)
 # ============================================================
@@ -215,13 +220,10 @@ def extract_feature(frame_bgr: np.ndarray, box: Tuple[int, int, int, int]) -> Op
     hist_v = cv2.calcHist([hsv], [2], None, [16], [0, 256]).reshape(-1)
     hist = np.concatenate([hist_h, hist_s, hist_v]).astype(np.float32)
 
-    # Normalize hist
     hist_sum = float(np.sum(hist)) + 1e-6
     hist /= hist_sum
 
     feat = np.concatenate([hog, hist]).astype(np.float32)
-
-    # L2 normalize feature vector
     n = float(np.linalg.norm(feat)) + 1e-6
     feat /= n
     return feat
@@ -232,22 +234,19 @@ def feature_distance(a: np.ndarray, b: np.ndarray) -> float:
 def dist_to_conf(dist: float) -> float:
     return float(np.exp(-dist / max(1e-6, DIST_SCALE)))
 
-
 # ============================================================
-# Candidate bbox detection (no shape assumptions)
+# Candidate bbox detection (edges -> blobs -> boxes)
 # ============================================================
 
 def detect_candidate_boxes(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # Edge map
     med = np.median(gray)
     lo = int(max(0, 0.90 * med))
     hi = int(min(255, 1.80 * med))
     edges = cv2.Canny(gray, lo, hi)
 
-    # Merge edges -> blobs
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     blobs = cv2.dilate(edges, k, iterations=1)
     blobs = cv2.morphologyEx(blobs, cv2.MORPH_CLOSE, k, iterations=1)
@@ -267,52 +266,39 @@ def detect_candidate_boxes(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, i
     boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
     return boxes
 
-
 # ============================================================
-# HITL prompts
+# HITL prompt
 # ============================================================
 
-def ask_user_action_lowconf(suggested: str, conf: float) -> str:
+def ask_user_action_lowconf(obj_id: int, conf: float) -> str:
     """
-    Returns: TARGET / OTHER / SKIP / CLEAR
+    Returns: TARGET / OTHER / NOT_OBJECT / SKIP / CLEAR
     """
     print("\n[HITL] Low confidence classification.")
-    print(f"[HITL] Suggested: {suggested} | confidence={conf*100:.1f}%")
+    print(f"[HITL] Object id={obj_id} | confidence={conf*100:.1f}%")
     print("  t) It's TARGET (learn it)")
     print("  o) It's OTHER")
+    print("  n) NOT an object (learn ignore)")
     print("  s) Skip (no motion)")
     print("  c) Clear target model (forget target)")
     while True:
-        ans = input("Choice (t/o/s/c): ").strip().lower()
-        if ans in ("t", "o", "s", "c"):
-            return {"t": LABEL_TARGET, "o": LABEL_OTHER, "s": "SKIP", "c": "CLEAR"}[ans]
+        ans = input("Choice (t/o/n/s/c): ").strip().lower()
+        if ans in ("t", "o", "n", "s", "c"):
+            return {
+                "t": LABEL_TARGET,
+                "o": LABEL_OTHER,
+                "n": "NOT_OBJECT",
+                "s": "SKIP",
+                "c": "CLEAR",
+            }[ans]
         print("Invalid input. Try again.")
-
 
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
-    # In-memory target model (resets on quit)
-    target_samples: List[np.ndarray] = []
-    target_center: Optional[np.ndarray] = None
-
-    def clear_target_model():
-        nonlocal target_samples, target_center
-        target_samples = []
-        target_center = None
-        print("[INFO] Cleared target model (in-memory).")
-
-    def update_target_center():
-        nonlocal target_center
-        if len(target_samples) == 0:
-            target_center = None
-            return
-        arr = np.vstack(target_samples).astype(np.float32)
-        c = arr.mean(axis=0).astype(np.float32)
-        c /= (float(np.linalg.norm(c)) + 1e-6)
-        target_center = c
+    cap = None
 
     # ---- RoboDK init ----
     rdk = robolink.Robolink()
@@ -344,7 +330,7 @@ def main():
             print(f"[WARN] Missing drop targets for {label}: {app_name}, {drop_name} (drop will be skipped for this label)")
         drop_targets[label] = (drop_app_t, drop_t)
 
-    # ---- Camera init ----
+    # ---- Camera init (must be before loop) ----
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
@@ -352,18 +338,39 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    # ---- Tracking state ----
+    # ---- In-memory models (reset on quit) ----
+    target_samples: List[np.ndarray] = []
+    target_center: Optional[np.ndarray] = None
+
+    not_object_samples: List[np.ndarray] = []
+    not_object_center: Optional[np.ndarray] = None
+
+    def update_center_from_samples(samples: List[np.ndarray]) -> Optional[np.ndarray]:
+        if len(samples) == 0:
+            return None
+        arr = np.vstack(samples).astype(np.float32)
+        c = arr.mean(axis=0).astype(np.float32)
+        c /= (float(np.linalg.norm(c)) + 1e-6)
+        return c
+
+    def clear_target_model():
+        nonlocal target_samples, target_center
+        target_samples = []
+        target_center = None
+        print("[INFO] Cleared TARGET model (in-memory).")
+
+    # ---- Tracking ----
     tracked: Dict[int, TrackedObj] = {}
     next_id = 1
     frame_idx = 0
 
-    # ---- Freeze + drag-box state ----
+    # ---- Freeze + drag ROI ----
     frozen = False
     frozen_frame = None
     dragging = False
     drag_start = (0, 0)
     drag_end = (0, 0)
-    roi_box: Optional[Tuple[int, int, int, int]] = None  # x,y,w,h
+    roi_box: Optional[Tuple[int, int, int, int]] = None
 
     def normalize_box(p1, p2):
         x1, y1 = p1
@@ -378,257 +385,278 @@ def main():
         nonlocal dragging, drag_start, drag_end, roi_box
         if not frozen:
             return
-
         if event == cv2.EVENT_LBUTTONDOWN:
             dragging = True
             drag_start = (x, y)
             drag_end = (x, y)
-
         elif event == cv2.EVENT_MOUSEMOVE and dragging:
             drag_end = (x, y)
-
         elif event == cv2.EVENT_LBUTTONUP and dragging:
             dragging = False
             drag_end = (x, y)
             x0, y0, w0, h0 = normalize_box(drag_start, drag_end)
-            if w0 >= 10 and h0 >= 10:
-                roi_box = (x0, y0, w0, h0)
+            roi_box = (x0, y0, w0, h0) if (w0 >= 10 and h0 >= 10) else None
+            if roi_box is not None:
                 print(f"[INFO] ROI selected: x={x0}, y={y0}, w={w0}, h={h0}")
-            else:
-                roi_box = None
-
-    print("[INFO] Box-based learning enabled (NO SAVING). Quit = full reset next run.")
-    print("[INFO] Keys: q/ESC quit | f freeze (draw ROI) | c clear target model")
-    print("[INFO] Workflow: press F -> drag box around TARGET -> it learns and AUTO-UNFREEZES.")
-    print("[INFO] Live: NEW stable objects classify TARGET vs OTHER. If uncertain, terminal prompts you (HITL).")
 
     cv2.namedWindow(WINDOW_NAME)
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
 
-    while True:
-        if not frozen:
-            ok, frame = cap.read()
-            if not ok:
-                break
-        else:
-            frame = frozen_frame.copy()
+    print("[INFO] Keys: q/ESC quit | f freeze (drag ROI to teach TARGET) | c clear TARGET model")
+    print("[INFO] Must see a candidate for ~2 seconds before it can trigger.")
+    print("[INFO] Low confidence => highlighted in magenta + terminal prompt (t/o/n/s/c).")
 
-        frame_idx += 1
-        now = time.time()
-
-        # Detect candidates (bboxes)
-        boxes = detect_candidate_boxes(frame)
-
-        # --- Feature extraction for each candidate box ---
-        dets: List[Tuple[int, int, int, int, np.ndarray]] = []  # cx,cy,w,h,feat
-        for (x, y, w, h) in boxes[:25]:
-            feat = extract_feature(frame, (x, y, w, h))
-            if feat is None:
-                continue
-            cx = x + w // 2
-            cy = y + h // 2
-            dets.append((cx, cy, w, h, feat))
-
-        # --- Greedy association ---
-        det_used = [False] * len(dets)
-        ids = list(tracked.keys())
-        pos = {oid: (tracked[oid].cx, tracked[oid].cy) for oid in ids}
-
-        matched: Dict[int, int] = {}
-        for di, (cx, cy, w, h, feat) in enumerate(dets):
-            best_id = None
-            best_d = 1e9
-            for oid in ids:
-                d = ((cx - pos[oid][0]) ** 2 + (cy - pos[oid][1]) ** 2) ** 0.5
-                if d < best_d:
-                    best_d = d
-                    best_id = oid
-            if best_id is not None and best_d <= MATCH_DIST_PX and best_id not in matched:
-                matched[best_id] = di
-                det_used[di] = True
-
-        # --- Update matched ---
-        for oid, di in matched.items():
-            cx, cy, w, h, feat = dets[di]
-            obj = tracked[oid]
-            obj.cx, obj.cy, obj.w, obj.h = cx, cy, w, h
-            obj.last_seen_frame = frame_idx
-            obj.last_update_t = now
-            obj.stable_frames += 1
-            obj.feat = feat
-
-        # --- Create new objects ---
-        for di, used in enumerate(det_used):
-            if used:
-                continue
-            cx, cy, w, h, feat = dets[di]
-            oid = next_id
-            next_id += 1
-            tracked[oid] = TrackedObj(
-                obj_id=oid, cx=cx, cy=cy, w=w, h=h,
-                last_seen_frame=frame_idx,
-                stable_frames=1,
-                last_update_t=now,
-                feat=feat,
-                label="UNASSIGNED",
-                acted=False
-            )
-
-        # --- Cleanup stale ---
-        stale = []
-        for oid, obj in tracked.items():
-            if frame_idx - obj.last_seen_frame > MISSING_FRAMES_TO_REMOVE:
-                stale.append(oid)
-        for oid in stale:
-            del tracked[oid]
-
-        # --- If frozen and ROI box exists, learn TARGET from ROI, then AUTO-UNFREEZE ---
-        if frozen and roi_box is not None:
-            x, y, w, h = roi_box
-            feat = extract_feature(frame, (x, y, w, h))
-            roi_box = None
-
-            if feat is not None:
-                target_samples.append(feat.astype(np.float32))
-                if len(target_samples) > MAX_TARGET_SAMPLES:
-                    target_samples = target_samples[-MAX_TARGET_SAMPLES:]
-                update_target_center()
-                print(f"[LEARN] Added TARGET sample. Samples={len(target_samples)}")
-
-                # Auto-unfreeze
-                frozen = False
-                frozen_frame = None
-                dragging = False
-                print("[INFO] Unfrozen (auto) — resume detection.")
-
-                # Mark anything currently visible as "SEEN" so only NEW arrivals trigger
-                for o in tracked.values():
-                    o.acted = True
-                    o.label = "SEEN"
+    try:
+        while True:
+            now = time.time()
+            if not frozen:
+                ok, frame = cap.read()
+                if not ok:
+                    break
             else:
-                print("[WARN] Could not extract features from ROI.")
+                frame = frozen_frame.copy()
 
-        # --- Inference / Motion on NEW stable objects ---
-        if target_center is not None:
-            for oid, obj in list(tracked.items()):
-                if obj.acted:
+            frame_idx += 1
+
+            # Candidates
+            boxes = detect_candidate_boxes(frame)
+
+            # Candidate features
+            dets: List[Tuple[int, int, int, int, int, int, np.ndarray]] = []  # x,y,w,h,cx,cy,feat
+            for (x, y, w, h) in boxes[:25]:
+                feat = extract_feature(frame, (x, y, w, h))
+                if feat is None:
                     continue
-                if obj.stable_frames < STABLE_FRAMES_TO_ACT:
+                cx = x + w // 2
+                cy = y + h // 2
+                dets.append((x, y, w, h, cx, cy, feat))
+
+            # Associate detections to tracked objects
+            det_used = [False] * len(dets)
+            ids = list(tracked.keys())
+            pos = {oid: (tracked[oid].cx, tracked[oid].cy) for oid in ids}
+
+            matched: Dict[int, int] = {}
+            for di, (_, _, _, _, cx, cy, _) in enumerate(dets):
+                best_id = None
+                best_d = 1e9
+                for oid in ids:
+                    d = ((cx - pos[oid][0]) ** 2 + (cy - pos[oid][1]) ** 2) ** 0.5
+                    if d < best_d:
+                        best_d = d
+                        best_id = oid
+                if best_id is not None and best_d <= MATCH_DIST_PX and best_id not in matched:
+                    matched[best_id] = di
+                    det_used[di] = True
+
+            # Update matched
+            for oid, di in matched.items():
+                x, y, w, h, cx, cy, feat = dets[di]
+                obj = tracked[oid]
+                obj.cx, obj.cy, obj.w, obj.h = cx, cy, w, h
+                obj.last_seen_frame = frame_idx
+                obj.last_update_t = now
+                obj.feat = feat
+
+            # Create new objects
+            for di, used in enumerate(det_used):
+                if used:
                     continue
-
-                dist = feature_distance(obj.feat, target_center)
-                conf = dist_to_conf(dist)
-
-                if conf >= CONF_THRESH_TARGET:
-                    final_label = LABEL_TARGET
-                    # auto-learn confident target hits
-                    target_samples.append(obj.feat.astype(np.float32))
-                    if len(target_samples) > MAX_TARGET_SAMPLES:
-                        target_samples = target_samples[-MAX_TARGET_SAMPLES:]
-                    update_target_center()
-
-                elif conf <= CONF_THRESH_OTHER:
-                    final_label = LABEL_OTHER
-
-                else:
-                    action = ask_user_action_lowconf(suggested=LABEL_TARGET, conf=conf)
-                    if action == "CLEAR":
-                        clear_target_model()
-                        obj.label = "CLEARED"
-                        obj.acted = True
-                        continue
-                    if action == "SKIP":
-                        obj.label = "SKIP"
-                        obj.acted = True
-                        continue
-
-                    final_label = action
-                    if final_label == LABEL_TARGET:
-                        target_samples.append(obj.feat.astype(np.float32))
-                        if len(target_samples) > MAX_TARGET_SAMPLES:
-                            target_samples = target_samples[-MAX_TARGET_SAMPLES:]
-                        update_target_center()
-
-                obj.label = final_label
-                obj.acted = True
-
-                Xmm, Ymm = apply_homography(H, (float(obj.cx), float(obj.cy)))
-                drop_app_t, drop_t = drop_targets.get(final_label, (None, None))
-
-                print(f"[ACTION] id={oid} -> {final_label} (conf={conf*100:.1f}%, dist={dist:.3f}) at XY=({Xmm:.1f},{Ymm:.1f})")
-
-                move_pick_and_optional_drop(
-                    robot=robot,
-                    base_T_board=base_T_board,
-                    pick_ref_pose_abs=pick_ref_pose_abs,
-                    Xmm=Xmm,
-                    Ymm=Ymm,
-                    t_app=t_pick_app,
-                    t_pick=t_pick,
-                    drop_app_t=drop_app_t,
-                    drop_t=drop_t,
-                    do_pick=DO_PICK_MOTION,
-                    do_drop=DO_DROP_MOTION
+                x, y, w, h, cx, cy, feat = dets[di]
+                oid = next_id
+                next_id += 1
+                tracked[oid] = TrackedObj(
+                    obj_id=oid,
+                    cx=cx, cy=cy, w=w, h=h,
+                    last_seen_frame=frame_idx,
+                    first_seen_t=now,
+                    last_update_t=now,
+                    feat=feat,
+                    label="UNASSIGNED",
+                    acted=False
                 )
 
-        # --- Visualization ---
-        vis = frame.copy()
+            # Remove stale
+            stale = [oid for oid, o in tracked.items() if frame_idx - o.last_seen_frame > MISSING_FRAMES_TO_REMOVE]
+            for oid in stale:
+                del tracked[oid]
 
-        if target_center is None:
-            msg = "NO TARGET: press F to freeze, then DRAG BOX around TARGET"
-        else:
-            msg = f"TARGET learned: samples={len(target_samples)} | NEW objects classify TARGET vs OTHER"
-        if frozen:
-            msg = "FROZEN: drag box around TARGET (auto-unfreeze after selection)"
-        cv2.putText(vis, msg, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+            # Learn TARGET from ROI (freeze) and auto-unfreeze
+            if frozen and roi_box is not None:
+                x, y, w, h = roi_box
+                roi_box = None
+                feat = extract_feature(frame, (x, y, w, h))
+                if feat is not None:
+                    target_samples.append(feat.astype(np.float32))
+                    if len(target_samples) > MAX_TARGET_SAMPLES:
+                        target_samples = target_samples[-MAX_TARGET_SAMPLES:]
+                    target_center = update_center_from_samples(target_samples)
+                    print(f"[LEARN] Added TARGET sample. Samples={len(target_samples)}")
 
-        # Draw candidate boxes (green)
-        for (x, y, w, h) in boxes[:25]:
-            cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 200, 0), 2)
+                    frozen = False
+                    frozen_frame = None
+                    dragging = False
+                    print("[INFO] Unfrozen (auto) — resume detection.")
 
-        # Draw tracked labels
-        for oid, obj in tracked.items():
-            x1 = int(obj.cx - obj.w / 2)
-            y1 = int(obj.cy - obj.h / 2)
-            cv2.putText(vis, f"id{oid} {obj.label} st={obj.stable_frames} acted={obj.acted}",
-                        (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                    # mark currently-visible candidates as SEEN so only NEW arrivals trigger
+                    for o in tracked.values():
+                        o.acted = True
+                        o.label = "SEEN"
+                else:
+                    print("[WARN] Could not extract features from ROI.")
 
+            # ---------- Base visualization ----------
+            vis = frame.copy()
+            if target_center is None:
+                msg = "NO TARGET: press F to freeze, drag ROI around TARGET"
+            else:
+                msg = f"TARGET learned: {len(target_samples)} samples | waiting for NEW objects (>=2s)"
+            if frozen:
+                msg = "FROZEN: drag ROI around TARGET (auto-unfreeze after selection)"
+            cv2.putText(vis, msg, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+            for (x, y, w, h) in boxes[:25]:
+                cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 200, 0), 2)
+
+            for oid, o in tracked.items():
+                x1 = int(o.cx - o.w / 2)
+                y1 = int(o.cy - o.h / 2)
+                age = max(0.0, now - o.first_seen_t)
+                cv2.putText(
+                    vis,
+                    f"id{oid} {o.label} age={age:.1f}s acted={o.acted}",
+                    (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 255, 255),
+                    1
+                )
+
+            if frozen and dragging:
+                x0, y0, w0, h0 = normalize_box(drag_start, drag_end)
+                cv2.rectangle(vis, (x0, y0), (x0 + w0, y0 + h0), (0, 255, 255), 2)
+
+            cv2.imshow(WINDOW_NAME, vis)
+
+            # ---------- Classification / motion ----------
             if target_center is not None:
-                dist = feature_distance(obj.feat, target_center)
-                conf = dist_to_conf(dist)
-                cv2.putText(vis, f"{conf*100:.0f}%",
-                            (x1, y1 + obj.h + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                for oid, o in list(tracked.items()):
+                    if o.acted:
+                        continue
 
-        # If dragging ROI while frozen, draw it (yellow)
-        if frozen and dragging:
-            x0, y0, w0, h0 = normalize_box(drag_start, drag_end)
-            cv2.rectangle(vis, (x0, y0), (x0 + w0, y0 + h0), (0, 255, 255), 2)
+                    # Must be visible for 2 seconds before it counts
+                    if (now - o.first_seen_t) < SEEN_SECONDS_TO_ACT:
+                        continue
 
-        cv2.imshow(WINDOW_NAME, vis)
-        key = cv2.waitKey(1) & 0xFF
+                    # Auto-ignore if matches NOT_OBJECT model
+                    if not_object_center is not None:
+                        d_no = feature_distance(o.feat, not_object_center)
+                        conf_no = dist_to_conf(d_no)
+                        if conf_no >= CONF_THRESH_NOT_OBJECT:
+                            o.label = "IGNORED"
+                            o.acted = True
+                            continue
 
-        # Quit
-        if key in (ord("q"), 27):
-            break
+                    # Target distance/conf
+                    dist = feature_distance(o.feat, target_center)
+                    conf = dist_to_conf(dist)
 
-        # Freeze
-        if key in (ord("f"), ord("F")):
-            frozen = True
-            frozen_frame = frame.copy()
-            dragging = False
-            roi_box = None
-            print("[INFO] Frozen. Drag a box around TARGET. (Auto-unfreeze after selection)")
+                    if conf >= CONF_THRESH_TARGET:
+                        final_label = LABEL_TARGET
+                    elif conf <= CONF_THRESH_OTHER:
+                        final_label = LABEL_OTHER
+                    else:
+                        # Highlight before prompting
+                        vis2 = frame.copy()
+                        x1 = int(o.cx - o.w / 2)
+                        y1 = int(o.cy - o.h / 2)
+                        cv2.rectangle(vis2, (x1, y1), (x1 + o.w, y1 + o.h), (255, 0, 255), 4)
+                        cv2.putText(vis2, f"HITL id={oid}", (x1, max(20, y1 - 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 255), 2)
+                        cv2.putText(vis2, f"age={(now-o.first_seen_t):.1f}s conf={conf*100:.1f}%",
+                                    (x1, y1 + o.h + 28),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+                        cv2.imshow(WINDOW_NAME, vis2)
+                        cv2.waitKey(1)
 
-        # Clear model
-        if key in (ord("c"), ord("C")):
-            clear_target_model()
-            for obj in tracked.values():
-                obj.acted = False
-                obj.label = "UNASSIGNED"
+                        action = ask_user_action_lowconf(obj_id=oid, conf=conf)
 
-    cap.release()
-    cv2.destroyAllWindows()
+                        if action == "CLEAR":
+                            clear_target_model()
+                            o.label = "CLEARED"
+                            o.acted = True
+                            continue
+                        if action == "SKIP":
+                            o.label = "SKIP"
+                            o.acted = True
+                            continue
+                        if action == "NOT_OBJECT":
+                            not_object_samples.append(o.feat.astype(np.float32))
+                            if len(not_object_samples) > MAX_NOT_OBJECT_SAMPLES:
+                                not_object_samples = not_object_samples[-MAX_NOT_OBJECT_SAMPLES:]
+                            not_object_center = update_center_from_samples(not_object_samples)
+                            o.label = "IGNORED_TRAINED"
+                            o.acted = True
+                            continue
 
+                        final_label = action
+
+                    o.label = final_label
+                    o.acted = True
+
+                    # Update models from label (in-memory only)
+                    if final_label == LABEL_TARGET:
+                        target_samples.append(o.feat.astype(np.float32))
+                        if len(target_samples) > MAX_TARGET_SAMPLES:
+                            target_samples = target_samples[-MAX_TARGET_SAMPLES:]
+                        target_center = update_center_from_samples(target_samples)
+
+                    # RoboDK action
+                    Xmm, Ymm = apply_homography(H, (float(o.cx), float(o.cy)))
+                    drop_app_t, drop_t = (None, None)
+                    if final_label in LABEL_TO_DROP_TARGETS:
+                        app_name, drop_name = LABEL_TO_DROP_TARGETS[final_label]
+                        drop_app_t, drop_t = drop_targets.get(final_label, (None, None))
+
+                    print(f"[ACTION] id={oid} -> {final_label} (age={now-o.first_seen_t:.1f}s conf={conf*100:.1f}%, dist={dist:.3f}) at XY=({Xmm:.1f},{Ymm:.1f})")
+
+                    move_pick_and_optional_drop(
+                        robot=robot,
+                        base_T_board=base_T_board,
+                        pick_ref_pose_abs=pick_ref_pose_abs,
+                        Xmm=Xmm,
+                        Ymm=Ymm,
+                        t_app=t_pick_app,
+                        t_pick=t_pick,
+                        drop_app_t=drop_app_t,
+                        drop_t=drop_t,
+                        do_pick=DO_PICK_MOTION,
+                        do_drop=DO_DROP_MOTION
+                    )
+
+            # ---------- keys ----------
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                break
+
+            if key in (ord("f"), ord("F")):
+                frozen = True
+                frozen_frame = frame.copy()
+                dragging = False
+                roi_box = None
+                print("[INFO] Frozen. Drag ROI around TARGET. (Auto-unfreeze after selection)")
+
+            if key in (ord("c"), ord("C")):
+                clear_target_model()
+                # allow re-processing
+                for o in tracked.values():
+                    o.acted = False
+                    o.label = "UNASSIGNED"
+
+    finally:
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
