@@ -13,7 +13,7 @@ from robodk import robolink, robomath
 
 BOARD_FRAME_NAME = "BoardFrame"
 PICK_REF_TARGET_NAME = "PickRef"
-H_FILE = r"C:\Users\noah\Desktop\Python Reference\HITLDT\homography.npy"  # <-- update
+H_FILE = r"C:\Users\noah\Desktop\HITL-DT\homography.npy"  # <-- update
 
 # Z heights in mm (relative to BoardFrame)
 Z_PICK_MM = 50.0
@@ -39,7 +39,7 @@ DYN_PICK_NAME = "CUR_PICK"
 # USER SETTINGS (Camera)
 # ============================================================
 
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 FRAME_W = 640
 FRAME_H = 480
 
