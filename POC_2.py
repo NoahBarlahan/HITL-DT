@@ -6,7 +6,6 @@ from typing import Dict, List, Tuple, Optional
 
 from robodk import robolink, robomath
 
-# Noah's testing
 # ============================================================
 # USER SETTINGS (RoboDK)
 # ============================================================
@@ -20,20 +19,21 @@ Z_PICK_MM = 50.0
 Z_APPROACH_MM = 100.0
 
 # Motion style
-DO_PICK_MOTION = True         # approach->pick->retract at object location
-DO_DROP_MOTION = True         # then move to bin drop targets (if they exist)
+DO_PICK_MOTION = True
+DO_DROP_MOTION = True
 
-# Targets for bin drop (must exist in RoboDK station, or drop is skipped)
-BIN_TO_DROP_TARGETS = {
-    "BIN_1": ("BIN_1_DROP_APP", "BIN_1_DROP"),
-    "BIN_2": ("BIN_2_DROP_APP", "BIN_2_DROP"),
-    "BIN_3": ("BIN_3_DROP_APP", "BIN_3_DROP"),
+# Two labels
+LABEL_TARGET = "TARGET"
+LABEL_OTHER = "OTHER"
+
+# Optional drop targets in RoboDK station (if missing, drop is skipped)
+LABEL_TO_DROP_TARGETS = {
+    LABEL_TARGET: ("TARGET_DROP_APP", "TARGET_DROP"),
+    LABEL_OTHER: ("OTHER_DROP_APP", "OTHER_DROP"),
 }
 
-# Names for dynamic pick targets we will update each time
 DYN_PICK_APP_NAME = "CUR_PICK_APP"
 DYN_PICK_NAME = "CUR_PICK"
-
 
 # ============================================================
 # USER SETTINGS (Camera)
@@ -43,50 +43,33 @@ CAMERA_INDEX = 0
 FRAME_W = 640
 FRAME_H = 480
 
-
 # ============================================================
-# VISION SETTINGS (Edge-based detection + robust color sampling)
+# VISION SETTINGS (Box-draw training + robust detection)
 # ============================================================
 
-# Geometry filters
-MIN_AREA_PX = 150
-MAX_AREA_PX = 150000
-ASPECT_MIN = 0.70
-ASPECT_MAX = 1.35
-SOLIDITY_MIN = 0.90
-APPROX_EPS_FRAC = 0.03
+WINDOW_NAME = "RoboDK + Box Learn (TARGET vs OTHER) [No Save]"
 
-# Color sampling: sample only the interior (avoid edge/background bleeding)
-INTERIOR_ERODE_PX = 8
-SAT_MIN = 15
-VAL_MIN = 15
+# Candidate region detection (bboxes)
+MIN_AREA_PX = 1000
+MAX_AREA_PX = 250000
 
 # Tracking
 MATCH_DIST_PX = 90
 MISSING_FRAMES_TO_REMOVE = 20
-STABLE_FRAMES_TO_ACT = 6  # require object to be stable before triggering motion
+STABLE_FRAMES_TO_ACT = 6
 
-# Training
-N_BINS = 3
-TRAIN_SECONDS = 3.0
-TRAIN_MIN_OBJECTS = 3
-TRAIN_MIN_SAMPLES_PER_OBJ = 25
-MIN_CENTER_SEPARATION = 0.18  # in feature space; prevents “3 bins = same color”
+# Confidence thresholds
+CONF_THRESH_TARGET = 0.80
+CONF_THRESH_OTHER = 0.30
 
-# Unknown detection
-UNKNOWN_DIST_THRESH = 0.35  # feature-space threshold; tune
+# Similarity scaling (higher => higher confidence)
+DIST_SCALE = 1.2
 
-# ============================================================
-# ONLINE LEARNING (NO SAVING; resets every run)
-# ============================================================
+# Template/feature sizes
+ROI_SIZE = (96, 96)  # normalization size for descriptors
+HOG_WIN = (96, 96)
 
-ONLINE_LEARN = True               # update centers during this run (in-memory only)
-LEARN_FROM_AUTOCONF = True        # also learn from confident auto labels
-AUTOCONF_LEARN_THRESH = 0.18      # only auto-learn if distance is small (tune)
-MAX_SAMPLES_PER_BIN = 800         # cap memory use per bin
-
-# If you want HITL to stop asking repeatedly for the same unknown within THIS run:
-USE_IN_MEMORY_UNKNOWN_RULES = True   # rules reset on quit
+MAX_TARGET_SAMPLES = 200
 
 
 # ============================================================
@@ -104,9 +87,8 @@ class TrackedObj:
     stable_frames: int
     last_update_t: float
 
-    mean_hsv: np.ndarray          # (3,)
-    feat: np.ndarray              # (4,) circular hue embedding + S + V
-    bin_name: str
+    feat: np.ndarray           # descriptor vector
+    label: str
     acted: bool
 
 
@@ -166,7 +148,6 @@ def move_pick_and_optional_drop(
     do_pick: bool,
     do_drop: bool
 ):
-    # Build pick poses (in abs)
     board_T_pick = robomath.transl(Xmm, Ymm, Z_PICK_MM)
     board_T_app  = robomath.transl(Xmm, Ymm, Z_PICK_MM + Z_APPROACH_MM)
 
@@ -176,7 +157,6 @@ def move_pick_and_optional_drop(
     pick_pose_abs = pose_with_ref_rotation(pick_ref_pose_abs, pick_pose_abs)
     app_pose_abs  = pose_with_ref_rotation(pick_ref_pose_abs, app_pose_abs)
 
-    # Update dynamic targets
     t_pick.setPoseAbs(pick_pose_abs)
     t_app.setPoseAbs(app_pose_abs)
 
@@ -197,204 +177,116 @@ def move_pick_and_optional_drop(
 
 
 # ============================================================
-# HITL prompt (no saving)
+# Feature extraction (HOG + HSV hist)
 # ============================================================
 
-def make_sig(mean_hsv: np.ndarray) -> str:
-    """
-    Coarse signature so 'similar' colors map to the same bucket during this run.
-    This is ONLY in-memory if USE_IN_MEMORY_UNKNOWN_RULES=True.
-    """
-    h = int(mean_hsv[0] // 8)
-    s = int(mean_hsv[1] // 16)
-    v = int(mean_hsv[2] // 16)
-    return f"h{h}_s{s}_v{v}"
+def make_hog():
+    return cv2.HOGDescriptor(
+        _winSize=HOG_WIN,
+        _blockSize=(32, 32),
+        _blockStride=(16, 16),
+        _cellSize=(16, 16),
+        _nbins=9
+    )
 
-def ask_user_unknown_action(sig: str, suggested: str) -> str:
-    """
-    Returns:
-      - BIN_1/2/3
-      - SKIP
-      - RETRAIN
-    """
-    print(f"\n[HITL] Unknown color encountered (signature={sig}).")
-    print(f"[HITL] Nearest bin guess: {suggested}")
-    print("[HITL] What should I do?")
-    print("  1) Assign to BIN_1")
-    print("  2) Assign to BIN_2")
-    print("  3) Assign to BIN_3")
-    print("  s) Skip (no motion)")
-    print("  r) Retrain bins")
-    while True:
-        ans = input("Choice (1/2/3/s/r): ").strip().lower()
-        if ans in ("1", "2", "3"):
-            return f"BIN_{ans}"
-        if ans == "s":
-            return "SKIP"
-        if ans == "r":
-            return "RETRAIN"
-        print("Invalid input. Try again.")
+HOG = make_hog()
+
+def extract_feature(frame_bgr: np.ndarray, box: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+    x, y, w, h = box
+    Hh, Ww = frame_bgr.shape[:2]
+    x = max(0, min(x, Ww - 1))
+    y = max(0, min(y, Hh - 1))
+    w = max(1, min(w, Ww - x))
+    h = max(1, min(h, Hh - y))
+    roi = frame_bgr[y:y+h, x:x+w]
+    if roi.size == 0:
+        return None
+
+    roi = cv2.resize(roi, ROI_SIZE, interpolation=cv2.INTER_AREA)
+
+    # HOG on gray
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hog = HOG.compute(gray).reshape(-1).astype(np.float32)
+
+    # HSV histogram (appearance)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hist_h = cv2.calcHist([hsv], [0], None, [24], [0, 180]).reshape(-1)
+    hist_s = cv2.calcHist([hsv], [1], None, [16], [0, 256]).reshape(-1)
+    hist_v = cv2.calcHist([hsv], [2], None, [16], [0, 256]).reshape(-1)
+    hist = np.concatenate([hist_h, hist_s, hist_v]).astype(np.float32)
+
+    # Normalize hist
+    hist_sum = float(np.sum(hist)) + 1e-6
+    hist /= hist_sum
+
+    feat = np.concatenate([hog, hist]).astype(np.float32)
+
+    # L2 normalize feature vector
+    n = float(np.linalg.norm(feat)) + 1e-6
+    feat /= n
+    return feat
+
+def feature_distance(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.linalg.norm(a - b))
+
+def dist_to_conf(dist: float) -> float:
+    return float(np.exp(-dist / max(1e-6, DIST_SCALE)))
 
 
 # ============================================================
-# Vision: edge-based detection + interior color feature
+# Candidate bbox detection (no shape assumptions)
 # ============================================================
 
-def detect_objects_edges(frame_bgr) -> List[Tuple[int, int, int, int, np.ndarray]]:
+def detect_candidate_boxes(frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
+    # Edge map
     med = np.median(gray)
-    lo = int(max(0, 0.66 * med))
-    hi = int(min(255, 1.33 * med))
+    lo = int(max(0, 0.90 * med))
+    hi = int(min(255, 1.80 * med))
     edges = cv2.Canny(gray, lo, hi)
 
+    # Merge edges -> blobs
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    edges = cv2.dilate(edges, k, iterations=1)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=2)
+    blobs = cv2.dilate(edges, k, iterations=1)
+    blobs = cv2.morphologyEx(blobs, cv2.MORPH_CLOSE, k, iterations=1)
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts, _ = cv2.findContours(blobs, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    dets = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
+    boxes = []
+    for c in cnts:
+        area = cv2.contourArea(c)
         if area < MIN_AREA_PX or area > MAX_AREA_PX:
             continue
-
-        x, y, w, h = cv2.boundingRect(cnt)
-        if w <= 0 or h <= 0:
+        x, y, w, h = cv2.boundingRect(c)
+        if w < 10 or h < 10:
             continue
+        boxes.append((x, y, w, h))
 
-        aspect = w / float(h)
-        if not (ASPECT_MIN <= aspect <= ASPECT_MAX):
-            continue
+    boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
+    return boxes
 
-        hull = cv2.convexHull(cnt)
-        hull_area = max(1.0, cv2.contourArea(hull))
-        sol = area / hull_area
-        if sol < SOLIDITY_MIN:
-            continue
 
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, APPROX_EPS_FRAC * peri, True)
-        if not (4 <= len(approx) <= 20):
-            continue
+# ============================================================
+# HITL prompts
+# ============================================================
 
-        cx = x + w // 2
-        cy = y + h // 2
-        dets.append((cx, cy, w, h, cnt))
-
-    return dets
-
-def roi_hsv_and_mask_from_contour(frame_bgr, contour: np.ndarray):
-    Hh, Ww = frame_bgr.shape[:2]
-    x, y, bw, bh = cv2.boundingRect(contour)
-    pad = 2
-    x1 = max(x - pad, 0)
-    y1 = max(y - pad, 0)
-    x2 = min(x + bw + pad, Ww - 1)
-    y2 = min(y + bh + pad, Hh - 1)
-
-    roi = frame_bgr[y1:y2, x1:x2]
-    if roi.size == 0:
-        return None, None
-
-    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-
-    shifted = contour.copy()
-    shifted[:, 0, 0] -= x1
-    shifted[:, 0, 1] -= y1
-
-    mask = np.zeros(hsv_roi.shape[:2], dtype=np.uint8)
-    cv2.drawContours(mask, [shifted], -1, 255, thickness=-1)
-    return hsv_roi, mask
-
-def mean_hsv_interior(hsv_roi: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
-    if hsv_roi is None or mask is None:
-        return None
-
-    if INTERIOR_ERODE_PX > 0:
-        k = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (2 * INTERIOR_ERODE_PX + 1, 2 * INTERIOR_ERODE_PX + 1)
-        )
-        mask_i = cv2.erode(mask, k, iterations=1)
-    else:
-        mask_i = mask
-
-    pix = hsv_roi[mask_i > 0]
-    if pix.size == 0:
-        return None
-
-    sat = pix[:, 1]
-    val = pix[:, 2]
-    keep = (sat >= SAT_MIN) & (val >= VAL_MIN)
-    pix = pix[keep]
-    if pix.shape[0] < 50:
-        return None
-
-    return pix.mean(axis=0).astype(np.float32)
-
-def hsv_to_feature(mean_hsv: np.ndarray) -> np.ndarray:
+def ask_user_action_lowconf(suggested: str, conf: float) -> str:
     """
-    Circular hue embedding:
-      feature = [cos(theta), sin(theta), S_norm, V_norm]
+    Returns: TARGET / OTHER / SKIP / CLEAR
     """
-    Hh, S, V = float(mean_hsv[0]), float(mean_hsv[1]), float(mean_hsv[2])
-    theta = 2.0 * np.pi * (Hh / 180.0)
-    return np.array([np.cos(theta), np.sin(theta), S / 255.0, V / 255.0], dtype=np.float32)
-
-def feature_to_hsv(center_feat: np.ndarray) -> np.ndarray:
-    c, s = float(center_feat[0]), float(center_feat[1])
-    ang = np.arctan2(s, c)
-    if ang < 0:
-        ang += 2.0 * np.pi
-    Hh = (ang * 180.0 / (2.0 * np.pi))
-    S = float(np.clip(center_feat[2] * 255.0, 0, 255))
-    V = float(np.clip(center_feat[3] * 255.0, 0, 255))
-    return np.array([Hh, S, V], dtype=np.float32)
-
-def hsv_patch_to_bgr(hsv_center: np.ndarray):
-    hsv_px = np.uint8([[[int(hsv_center[0]) % 180, int(hsv_center[1]), int(hsv_center[2])]]])
-    return cv2.cvtColor(hsv_px, cv2.COLOR_HSV2BGR)[0, 0].tolist()
-
-def train_bins_kmeans(features: np.ndarray) -> np.ndarray:
-    """
-    features: (N,4)
-    returns centers: (3,4), sorted by hue angle
-    """
-    features = features.astype(np.float32)
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 60, 0.2)
-    _, _, centers = cv2.kmeans(features, N_BINS, None, criteria, 8, cv2.KMEANS_PP_CENTERS)
-
-    hues = []
-    for c in centers:
-        hsv = feature_to_hsv(c)
-        hues.append(hsv[0])
-    order = np.argsort(np.array(hues))
-    return centers[order].astype(np.float32)
-
-def assign_bin(feature: np.ndarray, centers: np.ndarray) -> Tuple[str, float]:
-    d = np.linalg.norm(centers - feature[None, :], axis=1)
-    idx = int(np.argmin(d))
-    return f"BIN_{idx+1}", float(d[idx])
-
-def recompute_centers_from_samples(samples: Dict[str, List[np.ndarray]], fallback_centers: np.ndarray) -> np.ndarray:
-    """
-    In-memory online learning: per-bin center = mean(samples) if any, else keep current center.
-    Normalizes the (cos,sin) part to stay on the unit circle.
-    """
-    new_centers = fallback_centers.copy().astype(np.float32)
-    for i, b in enumerate(("BIN_1", "BIN_2", "BIN_3")):
-        if len(samples[b]) > 0:
-            arr = np.vstack(samples[b]).astype(np.float32)
-            new_centers[i] = arr.mean(axis=0)
-
-            cs = new_centers[i, 0:2]
-            norm = float(np.linalg.norm(cs))
-            if norm > 1e-6:
-                new_centers[i, 0:2] = cs / norm
-    return new_centers
+    print("\n[HITL] Low confidence classification.")
+    print(f"[HITL] Suggested: {suggested} | confidence={conf*100:.1f}%")
+    print("  t) It's TARGET (learn it)")
+    print("  o) It's OTHER")
+    print("  s) Skip (no motion)")
+    print("  c) Clear target model (forget target)")
+    while True:
+        ans = input("Choice (t/o/s/c): ").strip().lower()
+        if ans in ("t", "o", "s", "c"):
+            return {"t": LABEL_TARGET, "o": LABEL_OTHER, "s": "SKIP", "c": "CLEAR"}[ans]
+        print("Invalid input. Try again.")
 
 
 # ============================================================
@@ -402,9 +294,25 @@ def recompute_centers_from_samples(samples: Dict[str, List[np.ndarray]], fallbac
 # ============================================================
 
 def main():
-    # In-memory only; resets on quit
-    rules: Dict[str, str] = {}  # signature -> BIN_1/2/3 (optional; only within this run)
-    bin_samples: Dict[str, List[np.ndarray]] = {"BIN_1": [], "BIN_2": [], "BIN_3": []}
+    # In-memory target model (resets on quit)
+    target_samples: List[np.ndarray] = []
+    target_center: Optional[np.ndarray] = None
+
+    def clear_target_model():
+        nonlocal target_samples, target_center
+        target_samples = []
+        target_center = None
+        print("[INFO] Cleared target model (in-memory).")
+
+    def update_target_center():
+        nonlocal target_center
+        if len(target_samples) == 0:
+            target_center = None
+            return
+        arr = np.vstack(target_samples).astype(np.float32)
+        c = arr.mean(axis=0).astype(np.float32)
+        c /= (float(np.linalg.norm(c)) + 1e-6)
+        target_center = c
 
     # ---- RoboDK init ----
     rdk = robolink.Robolink()
@@ -428,13 +336,13 @@ def main():
 
     # Drop targets (optional)
     drop_targets: Dict[str, Tuple[Optional[robolink.Item], Optional[robolink.Item]]] = {}
-    for b in ("BIN_1", "BIN_2", "BIN_3"):
-        app_name, drop_name = BIN_TO_DROP_TARGETS[b]
+    for label in (LABEL_TARGET, LABEL_OTHER):
+        app_name, drop_name = LABEL_TO_DROP_TARGETS[label]
         drop_app_t = require_target(rdk, app_name)
         drop_t = require_target(rdk, drop_name)
         if drop_app_t is None or drop_t is None:
-            print(f"[WARN] Missing drop targets for {b}: {app_name}, {drop_name} (drop will be skipped for this bin)")
-        drop_targets[b] = (drop_app_t, drop_t)
+            print(f"[WARN] Missing drop targets for {label}: {app_name}, {drop_name} (drop will be skipped for this label)")
+        drop_targets[label] = (drop_app_t, drop_t)
 
     # ---- Camera init ----
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
@@ -444,43 +352,82 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    # ---- State ----
+    # ---- Tracking state ----
     tracked: Dict[int, TrackedObj] = {}
-    per_obj_features: Dict[int, List[np.ndarray]] = {}
     next_id = 1
     frame_idx = 0
 
-    trained = False
-    centers: Optional[np.ndarray] = None
-    train_start = time.time()
+    # ---- Freeze + drag-box state ----
+    frozen = False
+    frozen_frame = None
+    dragging = False
+    drag_start = (0, 0)
+    drag_end = (0, 0)
+    roi_box: Optional[Tuple[int, int, int, int]] = None  # x,y,w,h
 
-    print("[INFO] Phase 1: TRAINING — place your 3 majority colors in view, separated.")
-    print(f"[INFO] Training time: {TRAIN_SECONDS:.1f}s (will auto-train).")
-    print("[INFO] Phase 2: INFERENCE — add NEW parts; system classifies and moves RoboDK robot.")
-    print("[INFO] HITL: unknown colors prompt you for action (assign/skip/retrain).")
-    print("[INFO] NOTE: NO SAVING. Quit = full reset next run.")
-    print("[INFO] Keys: q/ESC quit | r retrain bins")
+    def normalize_box(p1, p2):
+        x1, y1 = p1
+        x2, y2 = p2
+        x = min(x1, x2)
+        y = min(y1, y2)
+        w = abs(x2 - x1)
+        h = abs(y2 - y1)
+        return x, y, w, h
 
-    def reset_for_retrain():
-        nonlocal trained, centers, train_start, per_obj_features, rules, bin_samples
-        trained = False
-        centers = None
-        train_start = time.time()
-        per_obj_features = {}
-        rules = {}
-        bin_samples = {"BIN_1": [], "BIN_2": [], "BIN_3": []}
-        for o in tracked.values():
-            o.acted = False
-            o.bin_name = "UNASSIGNED"
+    def on_mouse(event, x, y, flags, param):
+        nonlocal dragging, drag_start, drag_end, roi_box
+        if not frozen:
+            return
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            dragging = True
+            drag_start = (x, y)
+            drag_end = (x, y)
+
+        elif event == cv2.EVENT_MOUSEMOVE and dragging:
+            drag_end = (x, y)
+
+        elif event == cv2.EVENT_LBUTTONUP and dragging:
+            dragging = False
+            drag_end = (x, y)
+            x0, y0, w0, h0 = normalize_box(drag_start, drag_end)
+            if w0 >= 10 and h0 >= 10:
+                roi_box = (x0, y0, w0, h0)
+                print(f"[INFO] ROI selected: x={x0}, y={y0}, w={w0}, h={h0}")
+            else:
+                roi_box = None
+
+    print("[INFO] Box-based learning enabled (NO SAVING). Quit = full reset next run.")
+    print("[INFO] Keys: q/ESC quit | f freeze (draw ROI) | c clear target model")
+    print("[INFO] Workflow: press F -> drag box around TARGET -> it learns and AUTO-UNFREEZES.")
+    print("[INFO] Live: NEW stable objects classify TARGET vs OTHER. If uncertain, terminal prompts you (HITL).")
+
+    cv2.namedWindow(WINDOW_NAME)
+    cv2.setMouseCallback(WINDOW_NAME, on_mouse)
 
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+        if not frozen:
+            ok, frame = cap.read()
+            if not ok:
+                break
+        else:
+            frame = frozen_frame.copy()
+
         frame_idx += 1
         now = time.time()
 
-        dets = detect_objects_edges(frame)  # (cx,cy,w,h,cnt)
+        # Detect candidates (bboxes)
+        boxes = detect_candidate_boxes(frame)
+
+        # --- Feature extraction for each candidate box ---
+        dets: List[Tuple[int, int, int, int, np.ndarray]] = []  # cx,cy,w,h,feat
+        for (x, y, w, h) in boxes[:25]:
+            feat = extract_feature(frame, (x, y, w, h))
+            if feat is None:
+                continue
+            cx = x + w // 2
+            cy = y + h // 2
+            dets.append((cx, cy, w, h, feat))
 
         # --- Greedy association ---
         det_used = [False] * len(dets)
@@ -488,11 +435,11 @@ def main():
         pos = {oid: (tracked[oid].cx, tracked[oid].cy) for oid in ids}
 
         matched: Dict[int, int] = {}
-        for di, (cx, cy, w, h, cnt) in enumerate(dets):
+        for di, (cx, cy, w, h, feat) in enumerate(dets):
             best_id = None
             best_d = 1e9
             for oid in ids:
-                d = ((cx - pos[oid][0])**2 + (cy - pos[oid][1])**2) ** 0.5
+                d = ((cx - pos[oid][0]) ** 2 + (cy - pos[oid][1]) ** 2) ** 0.5
                 if d < best_d:
                     best_d = d
                     best_id = oid
@@ -502,51 +449,30 @@ def main():
 
         # --- Update matched ---
         for oid, di in matched.items():
-            cx, cy, w, h, cnt = dets[di]
-            hsv_roi, mask = roi_hsv_and_mask_from_contour(frame, cnt)
-            mean = mean_hsv_interior(hsv_roi, mask)
-            if mean is None:
-                mean = tracked[oid].mean_hsv
-            feat = hsv_to_feature(mean)
-
+            cx, cy, w, h, feat = dets[di]
             obj = tracked[oid]
             obj.cx, obj.cy, obj.w, obj.h = cx, cy, w, h
             obj.last_seen_frame = frame_idx
             obj.last_update_t = now
             obj.stable_frames += 1
-            obj.mean_hsv = mean
             obj.feat = feat
-
-            if not trained:
-                per_obj_features.setdefault(oid, []).append(feat)
 
         # --- Create new objects ---
         for di, used in enumerate(det_used):
             if used:
                 continue
-            cx, cy, w, h, cnt = dets[di]
-            hsv_roi, mask = roi_hsv_and_mask_from_contour(frame, cnt)
-            mean = mean_hsv_interior(hsv_roi, mask)
-            if mean is None:
-                continue
-            feat = hsv_to_feature(mean)
-
+            cx, cy, w, h, feat = dets[di]
             oid = next_id
             next_id += 1
-
             tracked[oid] = TrackedObj(
                 obj_id=oid, cx=cx, cy=cy, w=w, h=h,
                 last_seen_frame=frame_idx,
                 stable_frames=1,
                 last_update_t=now,
-                mean_hsv=mean,
                 feat=feat,
-                bin_name="UNASSIGNED",
+                label="UNASSIGNED",
                 acted=False
             )
-
-            if not trained:
-                per_obj_features.setdefault(oid, []).append(feat)
 
         # --- Cleanup stale ---
         stale = []
@@ -555,114 +481,81 @@ def main():
                 stale.append(oid)
         for oid in stale:
             del tracked[oid]
-            per_obj_features.pop(oid, None)
 
-        # --- Training finish ---
-        if not trained:
-            if (now - train_start) >= TRAIN_SECONDS:
-                reps = []
-                for oid, feats in per_obj_features.items():
-                    if len(feats) < TRAIN_MIN_SAMPLES_PER_OBJ:
-                        continue
-                    arr = np.vstack(feats)  # (T,4)
-                    rep = np.median(arr, axis=0).astype(np.float32)
-                    reps.append(rep)
+        # --- If frozen and ROI box exists, learn TARGET from ROI, then AUTO-UNFREEZE ---
+        if frozen and roi_box is not None:
+            x, y, w, h = roi_box
+            feat = extract_feature(frame, (x, y, w, h))
+            roi_box = None
 
-                if len(reps) >= TRAIN_MIN_OBJECTS:
-                    reps = np.vstack(reps)
-                    centers = train_bins_kmeans(reps)
+            if feat is not None:
+                target_samples.append(feat.astype(np.float32))
+                if len(target_samples) > MAX_TARGET_SAMPLES:
+                    target_samples = target_samples[-MAX_TARGET_SAMPLES:]
+                update_target_center()
+                print(f"[LEARN] Added TARGET sample. Samples={len(target_samples)}")
 
-                    # Ensure centers are not collapsing
-                    pairwise = []
-                    for i in range(3):
-                        for j in range(i + 1, 3):
-                            pairwise.append(float(np.linalg.norm(centers[i] - centers[j])))
-                    min_sep = min(pairwise) if pairwise else 0.0
+                # Auto-unfreeze
+                frozen = False
+                frozen_frame = None
+                dragging = False
+                print("[INFO] Unfrozen (auto) — resume detection.")
 
-                    if min_sep < MIN_CENTER_SEPARATION:
-                        print(f"[WARN] Centers too close (min sep={min_sep:.3f}). Keep 3 different colors visible; retraining...")
-                        train_start = time.time()
-                        per_obj_features = {}
-                    else:
-                        trained = True
-                        print("\n[INFO] MODEL TRAINED: learned 3 dominant color bins (BIN_1..BIN_3).")
-                        print("[INFO] Existing objects will NOT trigger motion. Only NEW stable objects after this point will.\n")
+                # Mark anything currently visible as "SEEN" so only NEW arrivals trigger
+                for o in tracked.values():
+                    o.acted = True
+                    o.label = "SEEN"
+            else:
+                print("[WARN] Could not extract features from ROI.")
 
-                        for obj in tracked.values():
-                            obj.acted = True
-                            obj.bin_name = "TRAINING_SET"
-
-                        # Reset in-memory learners for inference phase (optional, but keeps it clean)
-                        rules = {}
-                        bin_samples = {"BIN_1": [], "BIN_2": [], "BIN_3": []}
-
-                else:
-                    print("[WARN] Not enough stable objects to train. Keep 3 blocks visible and separated; continuing training...")
-                    train_start = time.time()
-
-        # --- Inference / Motion (only for NEW stable objects) ---
-        if trained and centers is not None:
+        # --- Inference / Motion on NEW stable objects ---
+        if target_center is not None:
             for oid, obj in list(tracked.items()):
                 if obj.acted:
                     continue
                 if obj.stable_frames < STABLE_FRAMES_TO_ACT:
                     continue
 
-                # classify
-                bin_guess, dmin = assign_bin(obj.feat, centers)
-                sig = make_sig(obj.mean_hsv)
+                dist = feature_distance(obj.feat, target_center)
+                conf = dist_to_conf(dist)
 
-                forced = rules.get(sig) if USE_IN_MEMORY_UNKNOWN_RULES else None
-                final_bin: Optional[str] = None
+                if conf >= CONF_THRESH_TARGET:
+                    final_label = LABEL_TARGET
+                    # auto-learn confident target hits
+                    target_samples.append(obj.feat.astype(np.float32))
+                    if len(target_samples) > MAX_TARGET_SAMPLES:
+                        target_samples = target_samples[-MAX_TARGET_SAMPLES:]
+                    update_target_center()
 
-                # Unknown? Ask HITL
-                if (dmin > UNKNOWN_DIST_THRESH) and (forced is None):
-                    action = ask_user_unknown_action(sig=sig, suggested=bin_guess)
+                elif conf <= CONF_THRESH_OTHER:
+                    final_label = LABEL_OTHER
 
-                    if action == "RETRAIN":
-                        print("\n[INFO] Retraining started. Show your 3 majority colors again.")
-                        reset_for_retrain()
-                        break  # exit inference loop
-
+                else:
+                    action = ask_user_action_lowconf(suggested=LABEL_TARGET, conf=conf)
+                    if action == "CLEAR":
+                        clear_target_model()
+                        obj.label = "CLEARED"
+                        obj.acted = True
+                        continue
                     if action == "SKIP":
-                        obj.bin_name = "UNKNOWN_SKIP"
+                        obj.label = "SKIP"
                         obj.acted = True
                         continue
 
-                    # action is BIN_1/2/3
-                    final_bin = action
+                    final_label = action
+                    if final_label == LABEL_TARGET:
+                        target_samples.append(obj.feat.astype(np.float32))
+                        if len(target_samples) > MAX_TARGET_SAMPLES:
+                            target_samples = target_samples[-MAX_TARGET_SAMPLES:]
+                        update_target_center()
 
-                    # remember within this run (optional)
-                    if USE_IN_MEMORY_UNKNOWN_RULES:
-                        rules[sig] = action
-
-                    # ONLINE LEARNING from HITL label (in-memory only)
-                    if ONLINE_LEARN:
-                        bin_samples[final_bin].append(obj.feat.astype(np.float32))
-                        if len(bin_samples[final_bin]) > MAX_SAMPLES_PER_BIN:
-                            bin_samples[final_bin] = bin_samples[final_bin][-MAX_SAMPLES_PER_BIN:]
-                        centers = recompute_centers_from_samples(bin_samples, centers)
-
-                else:
-                    # Known by rule or normal auto classification
-                    final_bin = forced if forced is not None else bin_guess
-
-                    # Optional online learning from confident auto labels / forced rules
-                    if ONLINE_LEARN and LEARN_FROM_AUTOCONF:
-                        if (forced is not None) or (dmin <= AUTOCONF_LEARN_THRESH):
-                            bin_samples[final_bin].append(obj.feat.astype(np.float32))
-                            if len(bin_samples[final_bin]) > MAX_SAMPLES_PER_BIN:
-                                bin_samples[final_bin] = bin_samples[final_bin][-MAX_SAMPLES_PER_BIN:]
-                            centers = recompute_centers_from_samples(bin_samples, centers)
-
-                obj.bin_name = final_bin
+                obj.label = final_label
                 obj.acted = True
 
-                # Move RoboDK
                 Xmm, Ymm = apply_homography(H, (float(obj.cx), float(obj.cy)))
-                drop_app_t, drop_t = drop_targets.get(final_bin, (None, None))
+                drop_app_t, drop_t = drop_targets.get(final_label, (None, None))
 
-                print(f"[ACTION] id={oid} -> {final_bin} (d={dmin:.3f}) at XY=({Xmm:.1f},{Ymm:.1f})")
+                print(f"[ACTION] id={oid} -> {final_label} (conf={conf*100:.1f}%, dist={dist:.3f}) at XY=({Xmm:.1f},{Ymm:.1f})")
 
                 move_pick_and_optional_drop(
                     robot=robot,
@@ -681,44 +574,57 @@ def main():
         # --- Visualization ---
         vis = frame.copy()
 
-        if not trained:
-            remaining = max(0.0, TRAIN_SECONDS - (now - train_start))
-            cv2.putText(vis, "TRAINING: show 3 majority colors separated",
-                        (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-            cv2.putText(vis, f"training in {remaining:.1f}s",
-                        (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        if target_center is None:
+            msg = "NO TARGET: press F to freeze, then DRAG BOX around TARGET"
         else:
-            cv2.putText(vis, "TRAINED: new stable object -> classify -> RoboDK move",
-                        (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+            msg = f"TARGET learned: samples={len(target_samples)} | NEW objects classify TARGET vs OTHER"
+        if frozen:
+            msg = "FROZEN: drag box around TARGET (auto-unfreeze after selection)"
+        cv2.putText(vis, msg, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
-        if trained and centers is not None:
-            y0 = 70
-            for i in range(3):
-                hsv_c = feature_to_hsv(centers[i])
-                bgr = hsv_patch_to_bgr(hsv_c)
-                cv2.rectangle(vis, (20, y0 + i*28), (60, y0 + i*28 + 18), bgr, -1)
-                cv2.putText(vis, f"BIN_{i+1}", (70, y0 + i*28 + 14),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        # Draw candidate boxes (green)
+        for (x, y, w, h) in boxes[:25]:
+            cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 200, 0), 2)
 
-        for (cx, cy, w, h, cnt) in dets:
-            x = int(cx - w/2)
-            y = int(cy - h/2)
-            cv2.rectangle(vis, (x, y), (x+w, y+h), (0, 200, 0), 2)
-
+        # Draw tracked labels
         for oid, obj in tracked.items():
-            x1 = int(obj.cx - obj.w/2)
-            y1 = int(obj.cy - obj.h/2)
-            cv2.putText(vis, f"id{oid} {obj.bin_name} st={obj.stable_frames} acted={obj.acted}",
+            x1 = int(obj.cx - obj.w / 2)
+            y1 = int(obj.cy - obj.h / 2)
+            cv2.putText(vis, f"id{oid} {obj.label} st={obj.stable_frames} acted={obj.acted}",
                         (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
-        cv2.imshow("RoboDK + Trained Bins + HITL (No Save)", vis)
+            if target_center is not None:
+                dist = feature_distance(obj.feat, target_center)
+                conf = dist_to_conf(dist)
+                cv2.putText(vis, f"{conf*100:.0f}%",
+                            (x1, y1 + obj.h + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+        # If dragging ROI while frozen, draw it (yellow)
+        if frozen and dragging:
+            x0, y0, w0, h0 = normalize_box(drag_start, drag_end)
+            cv2.rectangle(vis, (x0, y0), (x0 + w0, y0 + h0), (0, 255, 255), 2)
+
+        cv2.imshow(WINDOW_NAME, vis)
         key = cv2.waitKey(1) & 0xFF
 
+        # Quit
         if key in (ord("q"), 27):
             break
-        if key in (ord("r"), ord("R")):
-            print("\n[INFO] Manual retrain triggered. Show your 3 majority colors again.")
-            reset_for_retrain()
+
+        # Freeze
+        if key in (ord("f"), ord("F")):
+            frozen = True
+            frozen_frame = frame.copy()
+            dragging = False
+            roi_box = None
+            print("[INFO] Frozen. Drag a box around TARGET. (Auto-unfreeze after selection)")
+
+        # Clear model
+        if key in (ord("c"), ord("C")):
+            clear_target_model()
+            for obj in tracked.values():
+                obj.acted = False
+                obj.label = "UNASSIGNED"
 
     cap.release()
     cv2.destroyAllWindows()
