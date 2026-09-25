@@ -1,0 +1,15 @@
+# Install all Python dependencies for this project:
+#   py -3.12 -m pip install -r requirements.txt
+#
+# CV-AprilTagModel.py downloads its official MediaPipe hand-landmarker model to
+# models/hand_landmarker.task automatically on first run (internet required).
+# Add every new third-party Python package used by project code to this file.
+
+# Camera access, image processing, and the optional OpenCV AprilTag detector.
+opencv-contrib-python
+
+# Active hand-tracking target used by CV-AprilTagModel.py.
+mediapipe>=0.10.35
+
+# Array calculations for target-center and pixel-offset measurements.
+numpy
