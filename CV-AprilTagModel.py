@@ -1,215 +1,163 @@
-"""Show a camera feed and the camera's pixel offset from a tracked target.
+"""Check a fixture AprilTag against a saved datum from a known camera pose.
 
-Install dependencies once before running this file:
-    py -3.12 -m pip install opencv-contrib-python mediapipe
+First run: return to known camera pose [P], then scan/save correct fixture [S].
+Restarts: [K] keep saved datum or [R] redo it. Confirm pose [P], then scan [S].
+After a successful scan, errors update live while the camera stays at that pose.
+[C] starts another check; [B] cancels a scan; [Q] quits.
+The robot must return to the SAME pose, including orientation, for every scan.
+Camera return is manually confirmed; robot motion is not controlled here.
 
-Active tracker: MediaPipe hand landmarks. The commented AprilTag section below
-is ready to use once a physical tag is available.
+Setup and calibration steps:
+1. Install: py -3.12 -m pip install -r requirements.txt
+2. Set the AprilTag family, ID, and *measured printed* edge size in
+   vision/vision_config.py. The edge size is measured between detection corners, not
+   the paper edge or white margin.
+3. For your Calib.io checkerboard, measure square size (15 mm) and count squares.
+4. Run: py -3.12 -m tools.calibration.calibrate_checkerboard --squares ACROSS DOWN
+   Use actual counts. Capture 25-40 varied views; Enter solves, S saves.
+   ChArUco remains an alternative via tools/calibration/calibrate_charuco.py.
+5. Run this script. Confirm reported tag X/Y/Z against a ruler and confirm
+   roll/pitch/yaw signs using deliberate, known rotations.
+6. Only after that validation, mount the camera on the robot and perform a
+   separate hand-eye calibration for TCP-to-camera pose.
+
+Without calibration/camera_calibration.npz this script still detects tag IDs
+but cannot save or compare a metric fixture datum.
 """
 
-from pathlib import Path
-from urllib.request import urlretrieve
-
 import cv2
-import mediapipe as mp
 import numpy as np
+from vision.camera_source import open_camera
+from vision.fixture_datum import FixtureDatumSession
+from vision.apriltag_tracking import load_calibration, estimate_tag_pose, tag_center_pixel
+
+from vision.vision_config import (
+    APRILTAG_DICTIONARY,
+    TARGET_TAG_ID,
+)
 
 
-# Set True before running to display a mirror image (webcam-style view).
+# Set True to mirror only the displayed image. Detection and pose use the
+# original image so the AprilTag's encoded pattern and coordinate system remain
+# correct.
 MIRROR_IMAGE = False
-CAMERA_INDICES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0]
-
-# Palm landmarks: wrist plus the four finger MCP joints. Their average is a
-# steadier target than a single fingertip.
-HAND_POSITION_LANDMARKS = (0, 5, 9, 13, 17)
-HAND_CONNECTIONS = (
-    (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12), (9, 13), (13, 14), (14, 15),
-    (15, 16), (13, 17), (17, 18), (18, 19), (19, 20), (0, 17),
-)
-
-# The current MediaPipe Tasks API requires a separate model bundle. The script
-# downloads this official bundle automatically on its first run.
-HAND_LANDMARKER_MODEL_PATH = Path(__file__).parent / "models" / "hand_landmarker.task"
-HAND_LANDMARKER_MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
-    "hand_landmarker/float16/latest/hand_landmarker.task"
-)
 
 
-def pixel_center(points):
-    """Return the integer center of an Nx2 collection of pixel points."""
-    return tuple(np.rint(np.mean(points, axis=0)).astype(int))
+def mirrored_corners(corners, frame_width):
+    """Convert detected corners to their positions in a mirrored display."""
+    mirrored = corners.copy()
+    mirrored[:, :, 0] = frame_width - 1 - mirrored[:, :, 0]
+    return mirrored
 
 
-def hand_center_pixels(hand_landmarks, frame_width, frame_height):
-    """Return one hand's palm center in pixel coordinates."""
-    points = [
-        (
-            hand_landmarks[index].x * frame_width,
-            hand_landmarks[index].y * frame_height,
-        )
-        for index in HAND_POSITION_LANDMARKS
-    ]
-    return pixel_center(points)
-
-
-def draw_hand_landmarks(frame, hand_landmarks):
-    """Draw MediaPipe Tasks hand landmarks without the retired Solutions API."""
-    height, width = frame.shape[:2]
-    points = [
-        (int(landmark.x * width), int(landmark.y * height))
-        for landmark in hand_landmarks
-    ]
-    for start, end in HAND_CONNECTIONS:
-        cv2.line(frame, points[start], points[end], (255, 100, 0), 2)
-    for point in points:
-        cv2.circle(frame, point, 3, (0, 255, 0), -1)
-
-
-def ensure_hand_landmarker_model():
-    """Download the official hand-landmarker model once, when needed."""
-    if HAND_LANDMARKER_MODEL_PATH.exists():
-        return
-
-    HAND_LANDMARKER_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    print("Downloading the MediaPipe hand-landmarker model (first run only)...")
-    try:
-        urlretrieve(HAND_LANDMARKER_MODEL_URL, HAND_LANDMARKER_MODEL_PATH)
-    except OSError as error:
-        raise RuntimeError(
-            "Could not download the hand-landmarker model. Check your internet "
-            f"connection, then download it from {HAND_LANDMARKER_MODEL_URL} to "
-            f"{HAND_LANDMARKER_MODEL_PATH}."
-        ) from error
-
-
-def draw_target_offset(frame, target_center, target_name):
-    """Draw a target offset with the camera frame center defined as (0, 0)."""
-    height, width = frame.shape[:2]
-    frame_center = (width // 2, height // 2)
-
-    # Image convention: +x is right and +y is down.
-    target_offset = (
-        target_center[0] - frame_center[0],
-        target_center[1] - frame_center[1],
-    )
-    # The inverse is the camera position relative to the tracked target.
-    camera_relative = (-target_offset[0], -target_offset[1])
-
-    cv2.drawMarker(frame, frame_center, (255, 255, 0), cv2.MARKER_CROSS, 22, 2)
-    cv2.circle(frame, target_center, 8, (0, 255, 0), -1)
-    cv2.line(frame, frame_center, target_center, (0, 255, 0), 2)
-    cv2.putText(
-        frame,
-        f"{target_name} offset: x={target_offset[0]:+d}, y={target_offset[1]:+d} px",
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 255, 0),
-        2,
-    )
-    cv2.putText(
-        frame,
-        f"Camera relative to {target_name}: x={camera_relative[0]:+d}, y={camera_relative[1]:+d} px",
-        (10, 58),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (0, 255, 0),
-        2,
-    )
+def draw_tag_measurements(frame, tag_corners, tag_id, pose):
+    """Mark the observed tag; the dashboard reports only errors from the datum."""
+    center = tuple(np.rint(tag_center_pixel(tag_corners)).astype(int))
+    cv2.circle(frame, center, 5, (0, 255, 0), -1)
 
 
 def main():
-    # Download before opening the camera so a download failure leaves no device
-    # handle open.
-    ensure_hand_landmarker_model()
+    if not hasattr(cv2, "aruco"):
+        print("AprilTag detection requires opencv-contrib-python. Reinstall requirements.txt.")
+        return
 
-    capture = None
-    for index in CAMERA_INDICES:
-        candidate = cv2.VideoCapture(index)
-        if candidate.isOpened():
-            ok, _ = candidate.read()
-            if ok:
-                capture = candidate
-                print(f"Using camera index {index}")
-                break
-        candidate.release()
+    calibration = load_calibration()
+    if calibration is None:
+        print("No calibration file found: datum capture and comparison unavailable.")
+    else:
+        print(
+            "Loaded calibration with RMS error "
+            f"{calibration['reprojection_error']:.4f} pixels."
+        )
 
+    capture = open_camera()
     if capture is None:
         print("No camera found. Check CAMERA_INDICES and camera permissions.")
         return
 
-    # AprilTag setup -- leave commented until a tag is available.
-    # This requires opencv-contrib-python, not just opencv-python.
-    # april_tag_dictionary = cv2.aruco.getPredefinedDictionary(
-    #     cv2.aruco.DICT_APRILTAG_36h11
-    # )
-    # april_tag_detector = cv2.aruco.ArucoDetector(april_tag_dictionary)
+    if calibration is not None and calibration["camera_identity"] != capture.camera_identity:
+        print("Calibration is for a different/unidentified camera. Metric pose disabled; recalibrate.")
+        calibration = None
 
-    options = mp.tasks.vision.HandLandmarkerOptions(
-        base_options=mp.tasks.BaseOptions(
-            model_asset_path=str(HAND_LANDMARKER_MODEL_PATH)
-        ),
-        running_mode=mp.tasks.vision.RunningMode.VIDEO,
-        num_hands=1,
-        min_hand_detection_confidence=0.6,
-        min_hand_presence_confidence=0.6,
-        min_tracking_confidence=0.6,
-    )
-    hand_landmarker = mp.tasks.vision.HandLandmarker.create_from_options(options)
-    timestamp_ms = 0
+    parameters = cv2.aruco.DetectorParameters()
+    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG
+    dictionary = cv2.aruco.getPredefinedDictionary(APRILTAG_DICTIONARY)
+    detector = cv2.aruco.ArucoDetector(dictionary, parameters)
+    warned_size_mismatch = False
+    session = FixtureDatumSession(capture.camera_identity, calibration)
 
     try:
         while True:
-            ok, frame = capture.read()
-            if not ok or frame is None:
+            ok, raw_frame = capture.read()
+            if not ok or raw_frame is None:
                 print("Could not read a frame from the camera.")
                 break
 
-            if MIRROR_IMAGE:
-                frame = cv2.flip(frame, 1)
+            active_calibration = calibration
+            raw_size = (raw_frame.shape[1], raw_frame.shape[0])
+            if calibration is not None and calibration["image_size"] != raw_size:
+                active_calibration = None
+                if not warned_size_mismatch:
+                    print(
+                        "Calibration image size does not match current stream; "
+                        "metric pose disabled. Recalibrate at this resolution."
+                    )
+                    warned_size_mismatch = True
 
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-            timestamp_ms += 1  # VIDEO mode requires strictly increasing times.
-            result = hand_landmarker.detect_for_video(
-                mp_frame, timestamp_ms
+            corners, tag_ids, _ = detector.detectMarkers(
+                cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
             )
+            frame = cv2.flip(raw_frame, 1) if MIRROR_IMAGE else raw_frame.copy()
+            observations = []
 
-            if result.hand_landmarks:
-                hand = result.hand_landmarks[0]
-                frame_height, frame_width = frame.shape[:2]
-                target_center = hand_center_pixels(hand, frame_width, frame_height)
-                draw_hand_landmarks(frame, hand)
-                draw_target_offset(frame, target_center, "hand")
-            else:
+            if tag_ids is None:
                 cv2.putText(
                     frame,
-                    "Show one hand to the camera",
+                    "No AprilTag detected",
                     (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
                     (0, 0, 255),
                     2,
                 )
+            else:
+                display_corners = (
+                    [mirrored_corners(tag, frame.shape[1]) for tag in corners]
+                    if MIRROR_IMAGE
+                    else corners
+                )
+                cv2.aruco.drawDetectedMarkers(frame, display_corners, tag_ids)
+                for raw_corners, shown_corners, tag_id in zip(
+                    corners, display_corners, tag_ids.flatten()
+                ):
+                    tag_id = int(tag_id)
+                    if TARGET_TAG_ID is None or tag_id == TARGET_TAG_ID:
+                        pose = estimate_tag_pose(raw_corners, active_calibration)
+                        observations.append((tag_id, pose))
+                        if session.expected_tag_id is None or tag_id == session.expected_tag_id:
+                            # Draw only one eligible tag's text to avoid overlapping labels.
+                            if len([t for t, _ in observations if session.expected_tag_id is None or t == session.expected_tag_id]) == 1:
+                                draw_tag_measurements(frame, shown_corners, tag_id, pose)
 
-            # AprilTag detection -- enable this block when you have a tag, then
-            # remove/disable the active MediaPipe hand block above.
-            # gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # tag_corners, tag_ids, _ = april_tag_detector.detectMarkers(gray_frame)
-            # if tag_ids is not None:
-            #     tag_index = 0  # Or select a particular tag ID here.
-            #     tag_center = pixel_center(tag_corners[tag_index][0])
-            #     cv2.aruco.drawDetectedMarkers(frame, tag_corners, tag_ids)
-            #     draw_target_offset(frame, tag_center, f"AprilTag {tag_ids[tag_index][0]}")
-
-            cv2.imshow("Hand camera offset", frame)
+            session.observe(observations, active_calibration is not None)
+            lines = session.dashboard_lines()
+            height, width = frame.shape[:2]
+            panel = np.full((height + 30 + 25*len(lines), width, 3), (23, 26, 31), dtype=np.uint8)
+            panel[:height] = frame
+            colors = dict(heading=(130, 215, 255), normal=(220, 225, 230),
+                          warning=(0, 185, 255), good=(100, 235, 125))
+            for index, (line, style) in enumerate(lines):
+                scale = 0.47
+                text_width = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0]
+                scale = min(scale, scale*(width-24)/max(1, text_width))
+                cv2.putText(panel, line, (12, height+25+25*index),
+                            cv2.FONT_HERSHEY_SIMPLEX, scale, colors[style], 1, cv2.LINE_AA)
+            cv2.imshow("AprilTag fixture datum", panel)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
+            session.handle_key(key)
     finally:
-        hand_landmarker.close()
         capture.release()
         cv2.destroyAllWindows()
 
